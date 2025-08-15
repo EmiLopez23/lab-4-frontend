@@ -12,8 +12,7 @@ import { Badge } from "../ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "../ui/avatar";
 
 export default function RepoCard({ repo }: { repo: Repo }) {
-  const { description, owner, forks, html_url, full_name, visibility, topics } =
-    repo;
+  const { description, owner, html_url, full_name, visibility, topics } = repo;
 
   return (
     <Card className="w-full max-w-md">
