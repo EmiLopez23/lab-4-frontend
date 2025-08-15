@@ -1,9 +1,9 @@
-import { useGetRepo } from "@/hooks";
+import { useRepo } from "@/hooks";
 import RepoCard from "@/components/repo-card";
 import RepoCardSkeleton from "@/components/repo-card/skeleton";
 
 export default function Home() {
-  const { data, isLoading, error } = useGetRepo("TanStack/query");
+  const { data, isLoading, error } = useRepo("TanStack/query");
 
   if (isLoading)
     return (
