@@ -25,10 +25,10 @@ jobs:
         run: npm ci
 
       - name: Build application
-        run: npm run build
         env:
           # Variables de entorno para el build
-          VITE_API_URL: https://api.tradepal-app.com
+          VITE_API_BASE_URL: https://api.tradepal-app.com
+        run: npm run build
 
       - name: Deploy to Azure Static Web Apps
         id: builddeploy
