@@ -40,3 +40,6 @@ jobs:
           app_location: "/"
           output_location: "dist"
           skip_app_build: false
+        env:
+          # Variables de entorno para el build
+          VITE_API_BASE_URL: https://api.tradepal-app.com
