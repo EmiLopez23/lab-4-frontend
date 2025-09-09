@@ -61,7 +61,7 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Update Linear + rename PR 
+      - name: Update Linear + rename PR
         if: steps.key.outputs.skip != 'true'
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
@@ -95,9 +95,9 @@ jobs:
           echo "QUERY_PAYLOAD: $QUERY_PAYLOAD"
 
           RES="$(graph "$QUERY_PAYLOAD")"
-          
+
           echo "RES: $RES"
-          
+
           ISSUE_ID=$(echo "$RES" | jq -r '.data.issues.nodes[0].id // empty')
 
           echo "ISSUE_ID: $ISSUE_ID"
