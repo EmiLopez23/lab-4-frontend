@@ -1,5 +1,9 @@
 name: Linear status sync (from branch)
 
+permissions:
+  contents: read
+  pull-requests: write # needed to rename the PR
+
 on:
   pull_request:
     types:
@@ -34,35 +38,44 @@ jobs:
           echo "IS_DRAFT=${{ github.event.pull_request.draft || false }}" >> $GITHUB_OUTPUT
           echo "REVIEW_STATE=${{ github.event.review.state || '' }}" >> $GITHUB_OUTPUT
           echo "LABEL_NAME=${{ github.event.label.name || '' }}" >> $GITHUB_OUTPUT
+          echo "PR_NUMBER=${{ github.event.pull_request.number || '' }}" >> $GITHUB_OUTPUT
+          echo "PR_TITLE=${{ github.event.pull_request.title || '' }}" >> $GITHUB_OUTPUT
 
-      - name: Find Linear issue key from branch (tra-123)
+      - name: Find Linear ticket from branch (tra-123)
         id: key
         run: |
           BRANCH="${{ steps.ctx.outputs.BRANCH }}"
           echo "Branch: $BRANCH"
-          # Busca tra-<número> en cualquier parte del nombre de la branch
           MATCH=$(echo "$BRANCH" | grep -oiE 'tra-[0-9]+' | head -n1 || true)
           if [ -z "$MATCH" ]; then
-            echo "No Linear key (tra-###) found in branch. Skipping."
+            echo "No tra-### in branch. Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            # Uppercase → TRA-###
-            KEY=$(echo "$MATCH" | tr '[:lower:]' '[:upper:]')
-            echo "Found Linear key: $KEY"
+            TEAMKEY=$(echo "$MATCH" | sed -E 's/-[0-9]+$//' | tr '[:lower:]' '[:upper:]') # TRA
+            NUM=$(echo "$MATCH" | grep -oE '[0-9]+')
+            KEY="$TEAMKEY-$NUM"
+            echo "Found: team=$TEAMKEY number=$NUM (key=$KEY)"
+            echo "team=$TEAMKEY" >> $GITHUB_OUTPUT
+            echo "num=$NUM" >> $GITHUB_OUTPUT
             echo "key=$KEY" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Update Linear state
+      - name: Update Linear + rename PR
         if: steps.key.outputs.skip != 'true'
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          LINEAR_TICKET_KEY: ${{ steps.key.outputs.key }}
+          TEAMKEY: ${{ steps.key.outputs.team }}
+          NUM: ${{ steps.key.outputs.num }}
           ACTION: ${{ steps.ctx.outputs.ACTION }}
           MERGED: ${{ steps.ctx.outputs.MERGED }}
           IS_DRAFT: ${{ steps.ctx.outputs.IS_DRAFT }}
           REVIEW_STATE: ${{ steps.ctx.outputs.REVIEW_STATE }}
           LABEL_NAME: ${{ steps.ctx.outputs.LABEL_NAME }}
+          PR_NUMBER: ${{ steps.ctx.outputs.PR_NUMBER }}
+          PR_TITLE: ${{ steps.ctx.outputs.PR_TITLE }}
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -73,19 +86,38 @@ jobs:
                  -d "$1"
           }
 
-          # 1) Obtener issue + estados del equipo
-          RES="$(graph "$(jq -nc --arg id "$LINEAR_TICKET_KEY" \
-            '{query:"query($id:String!){ issue(identifier:$id){ id state{ name } team{ key states{ nodes{ id name } } } } }", variables:{id:$id}}')")"
+          # ---- 1) Resolve issue by team key + number, and fetch team states ----
+          QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$NUM" \
+          '{query: "query($teamKey:String!,$num:Int!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id title state{ name } team{ key states{ nodes{ id name } } } } } }",
+            variables:{ teamKey:$teamKey, num:$num }}')
 
-          ISSUE_ID=$(echo "$RES" | jq -r '.data.issue.id // empty')
+          RES="$(graph "$QUERY_PAYLOAD")"
+          ISSUE_ID=$(echo "$RES" | jq -r '.data.issues.nodes[0].id // empty')
           if [ -z "$ISSUE_ID" ]; then
-            echo "Linear issue not found for $LINEAR_TICKET_KEY. Exiting."
+            echo "Linear issue not found for $TEAMKEY-$NUM. Exiting."
             exit 0
           fi
-          CURRENT_STATE=$(echo "$RES" | jq -r '.data.issue.state.name // ""')
-          STATES_JSON=$(echo "$RES" | jq '.data.issue.team.states.nodes')
+          LINEAR_TITLE=$(echo "$RES"   | jq -r '.data.issues.nodes[0].title')
+          CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // ""')
+          STATES_JSON=$(echo "$RES"    | jq    '.data.issues.nodes[0].team.states.nodes')
 
-          # 2) Decidir estado destino según evento
+          # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
+          if [ -n "$PR_NUMBER" ]; then
+            NEW_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
+            if [ "$PR_TITLE" != "$NEW_TITLE" ]; then
+              echo "Renaming PR #$PR_NUMBER → $NEW_TITLE"
+              PATCH=$(jq -nc --arg t "$NEW_TITLE" '{title:$t}')
+              curl -sS -X PATCH \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
+                -d "$PATCH" >/dev/null
+            else
+              echo "PR already has the desired title."
+            fi
+          fi
+
+          # ---- 3) Decide target state from event ----
           TARGET=""
           case "$ACTION" in
             opened|reopened|synchronize)
@@ -113,11 +145,11 @@ jobs:
             exit 0
           fi
           if [ "$TARGET" = "$CURRENT_STATE" ]; then
-            echo "Already in target state '$TARGET'. Skipping."
+            echo "Already in '$TARGET'. Skipping state update."
             exit 0
           fi
 
-          # 3) Buscar ID del estado por nombre y actualizar
+          # ---- 4) Find state ID by name & update ----
           STATE_ID=$(echo "$STATES_JSON" | jq -r --arg name "$TARGET" '.[] | select(.name==$name) | .id' | head -n1)
           if [ -z "$STATE_ID" ]; then
             echo "State '$TARGET' not found. Available:"
@@ -125,12 +157,14 @@ jobs:
             exit 1
           fi
 
-          UPDATE_RES="$(graph "$(jq -nc --arg issueId "$ISSUE_ID" --arg stateId "$STATE_ID" \
+          UPDATE=$(jq -nc --arg issueId "$ISSUE_ID" --arg stateId "$STATE_ID" \
             '{query:"mutation($issueId:String!,$stateId:String!){ issueUpdate(id:$issueId, input:{ stateId:$stateId }){ success } }",
-              variables:{ issueId:$issueId, stateId:$stateId }}')")"
-          if [ "$(echo "$UPDATE_RES" | jq -r '.data.issueUpdate.success')" != "true" ]; then
-            echo "Failed to update issue:"
-            echo "$UPDATE_RES"
+              variables:{ issueId:$issueId, stateId:$stateId }}')
+
+          RES_UPD="$(graph "$UPDATE")"
+          if [ "$(echo "$RES_UPD" | jq -r '.data.issueUpdate.success')" != "true" ]; then
+            echo "Failed to update Linear issue state:"
+            echo "$RES_UPD"
             exit 1
           fi
-          echo "Moved $LINEAR_TICKET_KEY: '$CURRENT_STATE' → '$TARGET'."
+          echo "Moved ${TEAMKEY}-${NUM}: '$CURRENT_STATE' → '$TARGET'."
