@@ -1,0 +1,136 @@
+name: Linear status sync (from branch)
+
+on:
+  pull_request:
+    types:
+      [
+        opened,
+        reopened,
+        synchronize,
+        closed,
+        ready_for_review,
+        converted_to_draft,
+      ]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [labeled]
+
+jobs:
+  sync-linear:
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'issues' && github.event.issue.pull_request)
+
+    steps:
+      - name: Gather context
+        id: ctx
+        run: |
+          echo "BRANCH=${GITHUB_HEAD_REF:-${{ github.event.pull_request.head.ref || '' }}}" >> $GITHUB_OUTPUT
+          echo "MERGED=${{ github.event.pull_request.merged || false }}" >> $GITHUB_OUTPUT
+          echo "ACTION=${{ github.event.action }}" >> $GITHUB_OUTPUT
+          echo "IS_DRAFT=${{ github.event.pull_request.draft || false }}" >> $GITHUB_OUTPUT
+          echo "REVIEW_STATE=${{ github.event.review.state || '' }}" >> $GITHUB_OUTPUT
+          echo "LABEL_NAME=${{ github.event.label.name || '' }}" >> $GITHUB_OUTPUT
+
+      - name: Find Linear issue key from branch (tra-123)
+        id: key
+        run: |
+          BRANCH="${{ steps.ctx.outputs.BRANCH }}"
+          echo "Branch: $BRANCH"
+          # Busca tra-<número> en cualquier parte del nombre de la branch
+          MATCH=$(echo "$BRANCH" | grep -oiE 'tra-[0-9]+' | head -n1 || true)
+          if [ -z "$MATCH" ]; then
+            echo "No Linear key (tra-###) found in branch. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            # Uppercase → TRA-###
+            KEY=$(echo "$MATCH" | tr '[:lower:]' '[:upper:]')
+            echo "Found Linear key: $KEY"
+            echo "key=$KEY" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update Linear state
+        if: steps.key.outputs.skip != 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          LINEAR_TICKET_KEY: ${{ steps.key.outputs.key }}
+          ACTION: ${{ steps.ctx.outputs.ACTION }}
+          MERGED: ${{ steps.ctx.outputs.MERGED }}
+          IS_DRAFT: ${{ steps.ctx.outputs.IS_DRAFT }}
+          REVIEW_STATE: ${{ steps.ctx.outputs.REVIEW_STATE }}
+          LABEL_NAME: ${{ steps.ctx.outputs.LABEL_NAME }}
+        run: |
+          set -euo pipefail
+
+          graph() {
+            curl -sS -H "Content-Type: application/json" \
+                 -H "Authorization: $LINEAR_API_KEY" \
+                 -X POST https://api.linear.app/graphql \
+                 -d "$1"
+          }
+
+          # 1) Obtener issue + estados del equipo
+          RES="$(graph "$(jq -nc --arg id "$LINEAR_TICKET_KEY" \
+            '{query:"query($id:String!){ issue(identifier:$id){ id state{ name } team{ key states{ nodes{ id name } } } } }", variables:{id:$id}}')")"
+
+          ISSUE_ID=$(echo "$RES" | jq -r '.data.issue.id // empty')
+          if [ -z "$ISSUE_ID" ]; then
+            echo "Linear issue not found for $LINEAR_TICKET_KEY. Exiting."
+            exit 0
+          fi
+          CURRENT_STATE=$(echo "$RES" | jq -r '.data.issue.state.name // ""')
+          STATES_JSON=$(echo "$RES" | jq '.data.issue.team.states.nodes')
+
+          # 2) Decidir estado destino según evento
+          TARGET=""
+          case "$ACTION" in
+            opened|reopened|synchronize)
+              if [ "$IS_DRAFT" = "true" ]; then TARGET="In Progress"; else TARGET="In Review"; fi
+              ;;
+            ready_for_review)       TARGET="In Review" ;;
+            converted_to_draft)     TARGET="In Progress" ;;
+            submitted)
+              case "$REVIEW_STATE" in
+                CHANGES_REQUESTED|changes_requested) TARGET="Changes requested" ;;
+                APPROVED|approved)                   TARGET="In Review" ;;
+                *) TARGET="" ;;
+              esac
+              ;;
+            closed)
+              if [ "$MERGED" = "true" ]; then TARGET="Done"; else TARGET="Canceled"; fi
+              ;;
+            labeled)
+              if [ "${LABEL_NAME,,}" = "duplicate" ]; then TARGET="Duplicate"; fi
+              ;;
+          esac
+
+          if [ -z "$TARGET" ]; then
+            echo "No target state for action '$ACTION'."
+            exit 0
+          fi
+          if [ "$TARGET" = "$CURRENT_STATE" ]; then
+            echo "Already in target state '$TARGET'. Skipping."
+            exit 0
+          fi
+
+          # 3) Buscar ID del estado por nombre y actualizar
+          STATE_ID=$(echo "$STATES_JSON" | jq -r --arg name "$TARGET" '.[] | select(.name==$name) | .id' | head -n1)
+          if [ -z "$STATE_ID" ]; then
+            echo "State '$TARGET' not found. Available:"
+            echo "$STATES_JSON" | jq -r '.[].name'
+            exit 1
+          fi
+
+          UPDATE_RES="$(graph "$(jq -nc --arg issueId "$ISSUE_ID" --arg stateId "$STATE_ID" \
+            '{query:"mutation($issueId:String!,$stateId:String!){ issueUpdate(id:$issueId, input:{ stateId:$stateId }){ success } }",
+              variables:{ issueId:$issueId, stateId:$stateId }}')")"
+          if [ "$(echo "$UPDATE_RES" | jq -r '.data.issueUpdate.success')" != "true" ]; then
+            echo "Failed to update issue:"
+            echo "$UPDATE_RES"
+            exit 1
+          fi
+          echo "Moved $LINEAR_TICKET_KEY: '$CURRENT_STATE' → '$TARGET'."
