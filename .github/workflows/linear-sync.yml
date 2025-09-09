@@ -91,15 +91,29 @@ jobs:
           '{query: "query($teamKey:String!,$num:Int!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id title state{ name } team{ key states{ nodes{ id name } } } } } }",
             variables:{ teamKey:$teamKey, num:$num }}')
 
+          echo "QUERY_PAYLOAD: $QUERY_PAYLOAD"
+
           RES="$(graph "$QUERY_PAYLOAD")"
+          
+          echo "RES: $RES"
+          
           ISSUE_ID=$(echo "$RES" | jq -r '.data.issues.nodes[0].id // empty')
+
+          echo "ISSUE_ID: $ISSUE_ID"
+
           if [ -z "$ISSUE_ID" ]; then
             echo "Linear issue not found for $TEAMKEY-$NUM. Exiting."
             exit 0
           fi
+
           LINEAR_TITLE=$(echo "$RES"   | jq -r '.data.issues.nodes[0].title')
           CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // ""')
           STATES_JSON=$(echo "$RES"    | jq    '.data.issues.nodes[0].team.states.nodes')
+
+          echo "LINEAR_TITLE: $LINEAR_TITLE"
+          echo "CURRENT_STATE: $CURRENT_STATE"
+          echo "STATES_JSON: $STATES_JSON"
+
 
           # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
           if [ -n "$PR_NUMBER" ]; then
