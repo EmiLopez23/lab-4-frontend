@@ -170,7 +170,28 @@ jobs:
           fi
           echo "Moved ${TEAMKEY}-${NUM}: '$CURRENT_STATE' → '$TARGET'."
 
-          echo "4) Attach PR to Linear issue"
+      - name: Rename PR
+        if: steps.key.outputs.skip != 'true'
+        run: |
+          # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
+           if [ -n "$PR_NUMBER" ]; then
+             NEW_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
+             if [ "$PR_TITLE" != "$NEW_TITLE" ]; then
+               echo "Renaming PR #$PR_NUMBER → $NEW_TITLE"
+               PATCH=$(jq -nc --arg t "$NEW_TITLE" '{title:$t}')
+               curl -sS -X PATCH \
+                 -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 -H "Accept: application/vnd.github+json" \
+                 https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
+                 -d "$PATCH" >/dev/null
+             else
+               echo "PR already has the desired title."
+             fi
+           fi
+
+      - name: Attach PR to Linear issue
+        if: steps.key.outputs.skip != 'true'
+        run: |
           PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
           ATTACH_TITLE="PR #$PR_NUMBER: $PR_TITLE"
           ATTACH_SUBTITLE="GitHub Pull Request"
@@ -192,22 +213,3 @@ jobs:
           CREATE_RES="$(graph "$CREATE_PAYLOAD")"
           echo "===> attachmentCreate response"
           echo "$CREATE_RES" | jq
-
-      - name: Rename PR
-        if: steps.key.outputs.skip != 'true'
-        run: |
-          # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
-           if [ -n "$PR_NUMBER" ]; then
-             NEW_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
-             if [ "$PR_TITLE" != "$NEW_TITLE" ]; then
-               echo "Renaming PR #$PR_NUMBER → $NEW_TITLE"
-               PATCH=$(jq -nc --arg t "$NEW_TITLE" '{title:$t}')
-               curl -sS -X PATCH \
-                 -H "Authorization: Bearer $GITHUB_TOKEN" \
-                 -H "Accept: application/vnd.github+json" \
-                 https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
-                 -d "$PATCH" >/dev/null
-             else
-               echo "PR already has the desired title."
-             fi
-           fi
