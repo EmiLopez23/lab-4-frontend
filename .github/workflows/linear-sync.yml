@@ -87,8 +87,8 @@ jobs:
           }
 
           # ---- 1) Resolve issue by team key + number, and fetch team states ----
-          QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$NUM" \
-          '{query: "query($teamKey:String!,$num:Int!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id title state{ name } team{ key states{ nodes{ id name } } } } } }",
+          QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$(jq -n --arg n "$NUM" '$n|tonumber')" \
+          '{query: "query($teamKey:String!,$num:Float!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id number title state{ name } team{ key states{ nodes{ id name } } } } } }",
             variables:{ teamKey:$teamKey, num:$num }}')
 
           echo "QUERY_PAYLOAD: $QUERY_PAYLOAD"
