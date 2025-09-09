@@ -86,6 +86,7 @@ jobs:
                  -d "$1"
           }
 
+          echo "1) Resolve issue by team key + number, and fetch team states"
           # ---- 1) Resolve issue by team key + number, and fetch team states ----
           QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$(jq -n --arg n "$NUM" '$n|tonumber')" \
           '{query: "query($teamKey:String!,$num:Float!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id number title state{ name } team{ key states{ nodes{ id name } } } } } }",
@@ -114,7 +115,31 @@ jobs:
           echo "CURRENT_STATE: $CURRENT_STATE"
           echo "STATES_JSON: $STATES_JSON"
 
+          echo 2) Add Github pr link to Linear issue
+          # ---- 2) Add Github pr link to Linear issue ----
+          PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+          ATTACH_TITLE="PR #$PR_NUMBER: $PR_TITLE"
+          ATTACH_SUBTITLE="GitHub Pull Request"
 
+          echo "===> Attaching PR to Linear issue"
+          CREATE_PAYLOAD=$(jq -nc \
+            --arg issueId "$ISSUE_ID" \
+            --arg url "$PR_URL" \
+            --arg title "$ATTACH_TITLE" \
+            --arg subtitle "$ATTACH_SUBTITLE" \
+            --arg icon "https://github.githubassets.com/favicons/favicon.png" \
+          '{
+            query: "mutation($input: AttachmentCreateInput!){ attachmentCreate(input:$input){ success attachment{ id } } }",
+            variables: { input: { issueId: $issueId, url: $url, title: $title, subtitle: $subtitle, iconUrl: $icon } }
+          }')
+
+          echo "===> Sending attachmentCreate"
+          echo "$CREATE_PAYLOAD" | jq
+          CREATE_RES="$(graph "$CREATE_PAYLOAD")"
+          echo "===> attachmentCreate response"
+          echo "$CREATE_RES" | jq
+
+          echo "3) Rename PR to '[TRA-123]: {title}' if needed"
           # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
           if [ -n "$PR_NUMBER" ]; then
             NEW_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
@@ -131,6 +156,7 @@ jobs:
             fi
           fi
 
+          echo "4) Decide target state from event"
           # ---- 3) Decide target state from event ----
           TARGET=""
           case "$ACTION" in
@@ -163,7 +189,8 @@ jobs:
             exit 0
           fi
 
-          # ---- 4) Find state ID by name & update ----
+          echo "5) Find state ID by name & update"
+          # ---- 5) Find state ID by name & update ----
           STATE_ID=$(echo "$STATES_JSON" | jq -r --arg name "$TARGET" '.[] | select(.name==$name) | .id' | head -n1)
           if [ -z "$STATE_ID" ]; then
             echo "State '$TARGET' not found. Available:"
