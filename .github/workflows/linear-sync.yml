@@ -108,7 +108,7 @@ jobs:
           fi
 
           LINEAR_TITLE=$(echo "$RES"   | jq -r '.data.issues.nodes[0].title')
-          CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // ""')
+          CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // empty')
           STATES_JSON=$(echo "$RES"    | jq    '.data.issues.nodes[0].team.states.nodes')
 
           echo "LINEAR_TITLE: $LINEAR_TITLE"
