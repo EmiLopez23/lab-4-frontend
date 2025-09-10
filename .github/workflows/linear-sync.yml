@@ -40,28 +40,26 @@ jobs:
           echo "LABEL_NAME=${{ github.event.label.name || '' }}" >> $GITHUB_OUTPUT
           echo "PR_NUMBER=${{ github.event.pull_request.number || '' }}" >> $GITHUB_OUTPUT
           echo "PR_TITLE=${{ github.event.pull_request.title || '' }}" >> $GITHUB_OUTPUT
+          echo "CREATED_AT=${{ github.event.pull_request.created_at || github.event.issue.created_at || '' }}" >> $GITHUB_OUTPUT
 
       - name: Find Linear ticket from branch (tra-123)
         id: key
         run: |
           BRANCH="${{ steps.ctx.outputs.BRANCH }}"
-          echo "Branch: $BRANCH"
           MATCH=$(echo "$BRANCH" | grep -oiE 'tra-[0-9]+' | head -n1 || true)
           if [ -z "$MATCH" ]; then
-            echo "No tra-### in branch. Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             TEAMKEY=$(echo "$MATCH" | sed -E 's/-[0-9]+$//' | tr '[:lower:]' '[:upper:]') # TRA
             NUM=$(echo "$MATCH" | grep -oE '[0-9]+')
             KEY="$TEAMKEY-$NUM"
-            echo "Found: team=$TEAMKEY number=$NUM (key=$KEY)"
             echo "team=$TEAMKEY" >> $GITHUB_OUTPUT
             echo "num=$NUM" >> $GITHUB_OUTPUT
             echo "key=$KEY" >> $GITHUB_OUTPUT
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Update Linear + rename PR
+      - name: Update Linear
         if: steps.key.outputs.skip != 'true'
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
@@ -74,6 +72,7 @@ jobs:
           LABEL_NAME: ${{ steps.ctx.outputs.LABEL_NAME }}
           PR_NUMBER: ${{ steps.ctx.outputs.PR_NUMBER }}
           PR_TITLE: ${{ steps.ctx.outputs.PR_TITLE }}
+          CREATED_AT: ${{ steps.ctx.outputs.CREATED_AT }}
           REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -86,20 +85,14 @@ jobs:
                  -d "$1"
           }
 
-          # ---- 1) Resolve issue by team key + number, and fetch team states ----
           QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$(jq -n --arg n "$NUM" '$n|tonumber')" \
           '{query: "query($teamKey:String!,$num:Float!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id number title state{ name } team{ key states{ nodes{ id name } } } } } }",
             variables:{ teamKey:$teamKey, num:$num }}')
 
-          echo "QUERY_PAYLOAD: $QUERY_PAYLOAD"
-
           RES="$(graph "$QUERY_PAYLOAD")"
-          
-          echo "RES: $RES"
-          
+
           ISSUE_ID=$(echo "$RES" | jq -r '.data.issues.nodes[0].id // empty')
 
-          echo "ISSUE_ID: $ISSUE_ID"
 
           if [ -z "$ISSUE_ID" ]; then
             echo "Linear issue not found for $TEAMKEY-$NUM. Exiting."
@@ -110,28 +103,7 @@ jobs:
           CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // ""')
           STATES_JSON=$(echo "$RES"    | jq    '.data.issues.nodes[0].team.states.nodes')
 
-          echo "LINEAR_TITLE: $LINEAR_TITLE"
-          echo "CURRENT_STATE: $CURRENT_STATE"
-          echo "STATES_JSON: $STATES_JSON"
 
-
-          # ---- 2) Rename PR to "[TRA-123]: {title}" if needed ----
-          if [ -n "$PR_NUMBER" ]; then
-            NEW_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
-            if [ "$PR_TITLE" != "$NEW_TITLE" ]; then
-              echo "Renaming PR #$PR_NUMBER → $NEW_TITLE"
-              PATCH=$(jq -nc --arg t "$NEW_TITLE" '{title:$t}')
-              curl -sS -X PATCH \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
-                -d "$PATCH" >/dev/null
-            else
-              echo "PR already has the desired title."
-            fi
-          fi
-
-          # ---- 3) Decide target state from event ----
           TARGET=""
           case "$ACTION" in
             opened|reopened|synchronize)
@@ -159,11 +131,10 @@ jobs:
             exit 0
           fi
           if [ "$TARGET" = "$CURRENT_STATE" ]; then
-            echo "Already in '$TARGET'. Skipping state update."
             exit 0
           fi
 
-          # ---- 4) Find state ID by name & update ----
+
           STATE_ID=$(echo "$STATES_JSON" | jq -r --arg name "$TARGET" '.[] | select(.name==$name) | .id' | head -n1)
           if [ -z "$STATE_ID" ]; then
             echo "State '$TARGET' not found. Available:"
@@ -181,4 +152,37 @@ jobs:
             echo "$RES_UPD"
             exit 1
           fi
-          echo "Moved ${TEAMKEY}-${NUM}: '$CURRENT_STATE' → '$TARGET'."
+
+
+          
+          # ---- Create or Update the Linear attachment (Links) ----
+          
+          PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
+          PR_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
+          
+          CHECK_PAYLOAD=$(jq -nc --arg url "$PR_URL" \
+            '{query:"query($url:String!){ attachmentsForURL(url:$url){ nodes{ id issue{ id } } } }",
+              variables:{ url:$url }}')
+
+          CHECK_RES="$(graph "$CHECK_PAYLOAD")"
+
+          EXISTING_ID=$(echo "$CHECK_RES" | jq -r '.data.attachmentsForURL.nodes[0].id // empty')
+
+          if [ -n "$EXISTING_ID" ]; then
+            UPDATE_ATTACH=$(jq -nc \
+              --arg id "$EXISTING_ID" \
+              --arg title "$PR_TITLE" \
+              '{query:"mutation($id:String!,$title:String!){ attachmentUpdate(id:$id, input:{ title:$title }){ success }}",
+                variables:{ id:$id, title:$title }}')
+            graph "$UPDATE_ATTACH" > /dev/null
+          else
+            CREATE_ATTACH=$(jq -nc \
+              --arg issueId "$ISSUE_ID" \
+              --arg url "$PR_URL" \
+              --arg title "$PR_TITLE" \
+              --arg icon "https://github.githubassets.com/favicons/favicon.png" \
+              --argjson metadata "$(jq -n --arg repo "$REPO" --arg pr "$PR_NUMBER" --arg createdAt "${CREATED_AT:-}" '{repo:$repo, prNumber:$pr, createdAt:$createdAt}')" \
+              '{query:"mutation($input: AttachmentCreateInput!){ attachmentCreate(input:$input){ success attachment{ id } } }",
+                variables:{ input:{ issueId:$issueId, url:$url, title:$title, iconUrl:$icon, metadata:$metadata }}}')
+            graph "$CREATE_ATTACH" > /dev/null
+          fi
