@@ -154,28 +154,12 @@ jobs:
           fi
 
 
+          
+          # ---- Create or Update the Linear attachment (Links) ----
+          
           PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
           PR_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
-
-          # Determine PR status for metadata
-          STATUS=""
-          if [ "${MERGED}" = "true" ]; then
-            STATUS="Merged"
-          elif [ "${IS_DRAFT}" = "true" ]; then
-            STATUS="Draft"
-          else
-            STATUS="Open"
-          fi
-
-          # Incorporate review state for review events
-          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
-            case "${REVIEW_STATE}" in
-              CHANGES_REQUESTED|changes_requested) STATUS="Changes requested" ;;
-              APPROVED|approved)                   STATUS="Approved" ;;
-            esac
-          fi
-
-          # ---- 2c) Create or Update the Linear attachment (Links)
+          
           CHECK_PAYLOAD=$(jq -nc --arg url "$PR_URL" \
             '{query:"query($url:String!){ attachmentsForURL(url:$url){ nodes{ id issue{ id } } } }",
               variables:{ url:$url }}')
@@ -197,7 +181,7 @@ jobs:
               --arg url "$PR_URL" \
               --arg title "$PR_TITLE" \
               --arg icon "https://github.githubassets.com/favicons/favicon.png" \
-              --argjson metadata "$(jq -n --arg repo "$REPO" --arg pr "$PR_NUMBER" --arg createdAt "${CREATED_AT:-}" --arg status "$STATUS" --arg merged "$MERGED" --arg isDraft "$IS_DRAFT" '{repo:$repo, prNumber:$pr, createdAt:$createdAt, status:$status, merged:($merged|test("true")), isDraft:($isDraft|test("true"))}')" \
+              --argjson metadata "$(jq -n --arg repo "$REPO" --arg pr "$PR_NUMBER" --arg createdAt "${CREATED_AT:-}" '{repo:$repo, prNumber:$pr, createdAt:$createdAt}')" \
               '{query:"mutation($input: AttachmentCreateInput!){ attachmentCreate(input:$input){ success attachment{ id } } }",
                 variables:{ input:{ issueId:$issueId, url:$url, title:$title, iconUrl:$icon, metadata:$metadata }}}')
             graph "$CREATE_ATTACH" > /dev/null
