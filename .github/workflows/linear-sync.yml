@@ -40,21 +40,19 @@ jobs:
           echo "LABEL_NAME=${{ github.event.label.name || '' }}" >> $GITHUB_OUTPUT
           echo "PR_NUMBER=${{ github.event.pull_request.number || '' }}" >> $GITHUB_OUTPUT
           echo "PR_TITLE=${{ github.event.pull_request.title || '' }}" >> $GITHUB_OUTPUT
+          echo "CREATED_AT=${{ github.event.pull_request.created_at || github.event.issue.created_at || '' }}" >> $GITHUB_OUTPUT
 
       - name: Find Linear ticket from branch (tra-123)
         id: key
         run: |
           BRANCH="${{ steps.ctx.outputs.BRANCH }}"
-          echo "Branch: $BRANCH"
           MATCH=$(echo "$BRANCH" | grep -oiE 'tra-[0-9]+' | head -n1 || true)
           if [ -z "$MATCH" ]; then
-            echo "No tra-### in branch. Skipping."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
             TEAMKEY=$(echo "$MATCH" | sed -E 's/-[0-9]+$//' | tr '[:lower:]' '[:upper:]') # TRA
             NUM=$(echo "$MATCH" | grep -oE '[0-9]+')
             KEY="$TEAMKEY-$NUM"
-            echo "Found: team=$TEAMKEY number=$NUM (key=$KEY)"
             echo "team=$TEAMKEY" >> $GITHUB_OUTPUT
             echo "num=$NUM" >> $GITHUB_OUTPUT
             echo "key=$KEY" >> $GITHUB_OUTPUT
@@ -74,6 +72,7 @@ jobs:
           LABEL_NAME: ${{ steps.ctx.outputs.LABEL_NAME }}
           PR_NUMBER: ${{ steps.ctx.outputs.PR_NUMBER }}
           PR_TITLE: ${{ steps.ctx.outputs.PR_TITLE }}
+          CREATED_AT: ${{ steps.ctx.outputs.CREATED_AT }}
           REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -85,8 +84,6 @@ jobs:
                  -X POST https://api.linear.app/graphql \
                  -d "$1"
           }
-
-          echo "1) Resolve issue by team key + number, and fetch team states"
 
           QUERY_PAYLOAD=$(jq -nc --arg teamKey "$TEAMKEY" --argjson num "$(jq -n --arg n "$NUM" '$n|tonumber')" \
           '{query: "query($teamKey:String!,$num:Float!){ issues(filter:{ number:{eq:$num}, team:{ key:{eq:$teamKey}}}){ nodes{ id number title state{ name } team{ key states{ nodes{ id name } } } } } }",
@@ -106,7 +103,6 @@ jobs:
           CURRENT_STATE=$(echo "$RES"  | jq -r '.data.issues.nodes[0].state.name // ""')
           STATES_JSON=$(echo "$RES"    | jq    '.data.issues.nodes[0].team.states.nodes')
 
-          echo "2) Decide target state from event"
 
           TARGET=""
           case "$ACTION" in
@@ -135,11 +131,9 @@ jobs:
             exit 0
           fi
           if [ "$TARGET" = "$CURRENT_STATE" ]; then
-            echo "Already in '$TARGET'. Skipping state update."
             exit 0
           fi
 
-          echo "3) Find state ID by name & update"
 
           STATE_ID=$(echo "$STATES_JSON" | jq -r --arg name "$TARGET" '.[] | select(.name==$name) | .id' | head -n1)
           if [ -z "$STATE_ID" ]; then
@@ -158,85 +152,35 @@ jobs:
             echo "$RES_UPD"
             exit 1
           fi
-          echo "Moved ${TEAMKEY}-${NUM}: '$CURRENT_STATE' → '$TARGET'."
 
 
           PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
-          ATTACH_TITLE="PR #$PR_NUMBER: $PR_TITLE"
-          ATTACH_SUBTITLE="GitHub Pull Request"
-
-          echo "ATTACH PR"
-
-          PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
-
-          STATUS_EMOJI=""
-          if [ "${MERGED}" = "true" ]; then
-            STATUS="Merged"; STATUS_EMOJI="✅"
-          elif [ "${IS_DRAFT}" = "true" ]; then
-            STATUS="Draft"; STATUS_EMOJI="📝"
-          else
-            STATUS="Open"; STATUS_EMOJI="🔓"
-          fi
-
-          CHECKS_TEXT=""
-          if [ -n "${HEAD_SHA:-}" ]; then
-            CHECKS_JSON="$(curl -sS \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100")" || true
-            TOTAL=$(echo "$CHECKS_JSON" | jq -r '.total_count // 0')
-            PASSED=$(echo "$CHECKS_JSON" | jq -r '[.check_runs[] | select(.conclusion=="success")] | length')
-            if [ "${TOTAL:-0}" -gt 0 ]; then
-              CHECKS_TEXT=" • Checks: ${PASSED}/${TOTAL} passing"
-            fi
-          fi
-
-          # Incorporate review state for review events
-          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
-            case "${REVIEW_STATE}" in
-              CHANGES_REQUESTED|changes_requested) STATUS="Changes requested"; STATUS_EMOJI="🛠️" ;;
-              APPROVED|approved)                   STATUS="Approved";          STATUS_EMOJI="✅" ;;
-            esac
-          fi
-
-          SUBTITLE="${STATUS_EMOJI} ${STATUS}${CHECKS_TEXT}"
-          echo "Attachment subtitle: $SUBTITLE"
-          echo "PR_URL=$PR_URL"
+          PR_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
 
           # ---- 2c) Create or Update the Linear attachment (Links)
           CHECK_PAYLOAD=$(jq -nc --arg url "$PR_URL" \
             '{query:"query($url:String!){ attachmentsForURL(url:$url){ nodes{ id issue{ id } } } }",
               variables:{ url:$url }}')
-          echo "===> attachmentsForURL payload"
-          echo "$CHECK_PAYLOAD" | jq
 
           CHECK_RES="$(graph "$CHECK_PAYLOAD")"
-          echo "===> attachmentsForURL response"
-          echo "$CHECK_RES" | jq
 
           EXISTING_ID=$(echo "$CHECK_RES" | jq -r '.data.attachmentsForURL.nodes[0].id // empty')
 
           if [ -n "$EXISTING_ID" ]; then
-            echo "Updating existing attachment id=$EXISTING_ID"
             UPDATE_ATTACH=$(jq -nc \
               --arg id "$EXISTING_ID" \
-              --arg title "PR #$PR_NUMBER: $PR_TITLE" \
-              --arg subtitle "$SUBTITLE" \
-              '{query:"mutation($id:String!,$title:String!,$subtitle:String!){ attachmentUpdate(id:$id, input:{ title:$title, subtitle:$subtitle }){ success }}",
-                variables:{ id:$id, title:$title, subtitle:$subtitle }}')
-            echo "$UPDATE_ATTACH" | jq
-            graph "$UPDATE_ATTACH" | jq
+              --arg title "$PR_TITLE" \
+              '{query:"mutation($id:String!,$title:String!){ attachmentUpdate(id:$id, input:{ title:$title }){ success }}",
+                variables:{ id:$id, title:$title }}')
+            graph "$UPDATE_ATTACH" > /dev/null
           else
-            echo "Creating new attachment"
             CREATE_ATTACH=$(jq -nc \
               --arg issueId "$ISSUE_ID" \
               --arg url "$PR_URL" \
-              --arg title "PR #$PR_NUMBER: $PR_TITLE" \
-              --arg subtitle "$SUBTITLE" \
+              --arg title "$PR_TITLE" \
               --arg icon "https://github.githubassets.com/favicons/favicon.png" \
-              --argjson metadata "$(jq -n --arg repo "$REPO" --arg pr "$PR_NUMBER" --arg sha "${HEAD_SHA:-}" '{repo:$repo, prNumber:$pr, sha:$sha}')" \
+              --argjson metadata "$(jq -n --arg repo "$REPO" --arg pr "$PR_NUMBER" --arg createdAt "${CREATED_AT:-}" --arg status "$STATUS" --arg merged "$MERGED" --arg isDraft "$IS_DRAFT" '{repo:$repo, prNumber:$pr, createdAt:$createdAt, status:$status, merged:($merged|test("true")), isDraft:($isDraft|test("true"))}')" \
               '{query:"mutation($input: AttachmentCreateInput!){ attachmentCreate(input:$input){ success attachment{ id } } }",
-                variables:{ input:{ issueId:$issueId, url:$url, title:$title, subtitle:$subtitle, iconUrl:$icon, metadata:$metadata }}}')
-            echo "$CREATE_ATTACH" | jq
-            graph "$CREATE_ATTACH" | jq
+                variables:{ input:{ issueId:$issueId, url:$url, title:$title, iconUrl:$icon, metadata:$metadata }}}')
+            graph "$CREATE_ATTACH" > /dev/null
           fi
