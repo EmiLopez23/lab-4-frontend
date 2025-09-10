@@ -157,6 +157,24 @@ jobs:
           PR_URL="https://github.com/$REPO/pull/$PR_NUMBER"
           PR_TITLE="[${TEAMKEY}-${NUM}]: ${LINEAR_TITLE}"
 
+          # Determine PR status for metadata
+          STATUS=""
+          if [ "${MERGED}" = "true" ]; then
+            STATUS="Merged"
+          elif [ "${IS_DRAFT}" = "true" ]; then
+            STATUS="Draft"
+          else
+            STATUS="Open"
+          fi
+
+          # Incorporate review state for review events
+          if [ "${{ github.event_name }}" = "pull_request_review" ]; then
+            case "${REVIEW_STATE}" in
+              CHANGES_REQUESTED|changes_requested) STATUS="Changes requested" ;;
+              APPROVED|approved)                   STATUS="Approved" ;;
+            esac
+          fi
+
           # ---- 2c) Create or Update the Linear attachment (Links)
           CHECK_PAYLOAD=$(jq -nc --arg url "$PR_URL" \
             '{query:"query($url:String!){ attachmentsForURL(url:$url){ nodes{ id issue{ id } } } }",
